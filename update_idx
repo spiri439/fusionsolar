@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import requests
-from typing import Optional, Dict, Any, TypedDict, Literal
+from typing import Optional, Dict, Any, TypedDict, Literal, NamedTuple
 from dataclasses import dataclass
 import os
 from enum import Enum
@@ -14,9 +14,17 @@ logger = logging.getLogger(__name__)
 
 class SignalType(str, Enum):
     ACTIVE_POWER = "Active power"
+    CONSUMPTION = "Active power consumption"
+    GRID_POWER = "Active power to grid"
     INVERTER_STATUS = "Inverter status"
     DAILY_ENERGY = "Daily energy"
     GRID_VOLTAGE = "Grid voltage"
+    GRID_FREQUENCY = "Grid frequency"
+    POWER_FACTOR = "Power factor"
+    EFFICIENCY = "Efficiency"
+    INTERNAL_TEMP = "Internal temperature"
+    PEAK_POWER = "Peak active power of current day"
+    TOTAL_ENERGY = "Total energy"
 
 @dataclass
 class SolarSignal:
@@ -26,6 +34,47 @@ class SolarSignal:
     unit: str
     value: str
     latest_time: int
+
+def sendpb(title: str, body: str) -> None:
+    """ Sending notification via pushbullet.
+        Args:
+            title (str) : title of text.
+            body (str) : Body of text.
+    """
+    try:
+        data_send = {"type": "note", "title": title, "body": body}
+        ACCESS_TOKEN = 'pbtoken'
+        resp = requests.post('https://api.pushbullet.com/v2/pushes', 
+                           data=json.dumps(data_send),
+                           headers={'Authorization': 'Bearer ' + ACCESS_TOKEN, 
+                                  'Content-Type': 'application/json'})
+        if resp.status_code != 200:
+            logger.error(f"Failed to send Pushbullet notification. Status code: {resp.status_code}")
+        else:
+            logger.info(f"Sent Pushbullet notification: {title}")
+    except Exception as e:
+        logger.error(f"Failed to send Pushbullet notification: {str(e)}")
+
+def log_all_signals(data: Dict[str, Any]) -> None:
+    """Log all available signals from the response"""
+    try:
+        logger.info("=== Available Signals ===")
+        for group in data.get('data', []):
+            if isinstance(group, dict) and 'signals' in group:
+                for signal in group['signals']:
+                    name = signal.get('name', 'Unknown')
+                    value = signal.get('realValue', 'N/A')
+                    unit = signal.get('unit', '')
+                    logger.info(f"{name}: {value} {unit}")
+        logger.info("=====================")
+    except Exception as e:
+        logger.error(f"Failed to log signals: {str(e)}")
+
+class PowerData(NamedTuple):
+    """Structure for holding different power values"""
+    active_power: float
+    consumption: float
+    grid_power: float
 
 class SignalData(TypedDict):
     """Type hint for signal data from API"""
@@ -43,30 +92,10 @@ class APIResponse(TypedDict):
     failCode: int
     success: bool
 
-def sendpb(title: str, body: str) -> None:
-    """ Sending notification via pushbullet.
-        Args:
-            title (str) : title of text.
-            body (str) : Body of text.
-    """
-    try:
-        data_send = {"type": "note", "title": title, "body": body}
-        ACCESS_TOKEN = 'yourtoken'
-        resp = requests.post('https://api.pushbullet.com/v2/pushes', 
-                           data=json.dumps(data_send),
-                           headers={'Authorization': 'Bearer ' + ACCESS_TOKEN, 
-                                  'Content-Type': 'application/json'})
-        if resp.status_code != 200:
-            logger.error(f"Failed to send Pushbullet notification. Status code: {resp.status_code}")
-        else:
-            logger.info(f"Sent Pushbullet notification: {title}")
-    except Exception as e:
-        logger.error(f"Failed to send Pushbullet notification: {str(e)}")
-
 class FusionSolarClient:
     """Client for interacting with Huawei FusionSolar API"""
 
-    def __init__(self, cookies_file: str = "pathtocookie.txt") -> None:
+    def __init__(self, cookies_file: str = "cookiepath.txt") -> None:
         self.base_url = "https://uni002eu5.fusionsolar.huawei.com"
         self.session = requests.Session()
         self.session.headers.update({
@@ -159,28 +188,30 @@ class FusionSolarClient:
             )
             return None
 
-def send_to_domoticz(power_watts: float) -> bool:
+def send_to_domoticz(idx: int, value: float, name: str = "power") -> bool:
     """
-    Send power value to Domoticz
+    Send value to Domoticz
 
     Args:
-        power_watts: Power value in watts
+        idx: Domoticz device index
+        value: Value to send
+        name: Name of the value for logging
 
     Returns:
         bool: True if successful, False otherwise
     """
     try:
-        domoticz_url = "domoticzIP/json.htm"
+        domoticz_url = "192.168.0.10:8124/json.htm"
         params = {
             'param': 'udevice',
             'type': 'command',
-            'idx': 77,
+            'idx': idx,
             'nvalue': 0,
-            'svalue': str(int(power_watts))
+            'svalue': str(int(value))
         }
         auth = ('remote2', '3JFMxftFgtsnFc6pNM')
 
-        logger.info(f"Sending power value to Domoticz: {power_watts}W")
+        logger.info(f"Sending {name} value to Domoticz (idx {idx}): {value}W")
         logger.info(f"Domoticz URL: {domoticz_url}")
         logger.info(f"Request params: {params}")
 
@@ -189,7 +220,7 @@ def send_to_domoticz(power_watts: float) -> bool:
         logger.info(f"Domoticz response content: {response.text}")
 
         if response.status_code == 200:
-            logger.info(f"Successfully sent power value to Domoticz: {power_watts}W")
+            logger.info(f"Successfully sent {name} value to Domoticz: {value}W")
             return True
         else:
             logger.error(f"Failed to send to Domoticz. Status code: {response.status_code}")
@@ -198,21 +229,67 @@ def send_to_domoticz(power_watts: float) -> bool:
         logger.error(f"Error sending to Domoticz: {str(e)}")
         return False
 
-def extract_active_power(data: APIResponse) -> Optional[float]:
-    """Extract active power value from FusionSolar response"""
+def extract_power_data(data: APIResponse) -> Optional[PowerData]:
+    """Extract power values from FusionSolar response"""
     try:
+        active_power = consumption = grid_power = 0.0
+        found_any = False
+
         for group in data.get('data', []):
             if isinstance(group, dict) and 'signals' in group:
                 for signal in group['signals']:
-                    if signal.get('name') == SignalType.ACTIVE_POWER:
-                        power_kw = float(signal['realValue'])
-                        power_w = power_kw * 1000
-                        logger.info(f"Extracted active power: {power_kw}kW ({power_w}W)")
-                        return power_w
-        logger.error("Active power value not found in response data")
+                    name = signal.get('name')
+                    if name == SignalType.ACTIVE_POWER:
+                        active_power = float(signal['realValue']) * 1000
+                        logger.info(f"Extracted active power: {active_power/1000}kW ({active_power}W)")
+                        found_any = True
+                    elif name == SignalType.CONSUMPTION:
+                        consumption = float(signal['realValue']) * 1000
+                        logger.info(f"Extracted consumption: {consumption/1000}kW ({consumption}W)")
+                        found_any = True
+                    elif name == SignalType.GRID_POWER:
+                        grid_power = float(signal['realValue']) * 1000
+                        logger.info(f"Extracted grid power: {grid_power/1000}kW ({grid_power}W)")
+                        found_any = True
+
+        if found_any:
+            return PowerData(active_power, consumption, grid_power)
+        logger.error("No power values found in response data")
         return None
     except Exception as e:
-        logger.error(f"Failed to extract active power: {str(e)}")
+        logger.error(f"Failed to extract power values: {str(e)}")
+        return None
+
+def get_second_device_power(client: FusionSolarClient, device_dn: str = "NE=165147724") -> Optional[float]:
+    """
+    Get active power from second device and send to Domoticz
+    """
+    try:
+        data = client.get_device_realtime_data(device_dn)
+        if data is not None:
+            # Log all available signals first
+            log_all_signals(data)
+
+            # Extract active power
+            for group in data.get('data', []):
+                if isinstance(group, dict) and 'signals' in group:
+                    for signal in group['signals']:
+                        if signal.get('name') == SignalType.ACTIVE_POWER:
+                            power_w = float(signal['realValue'])  # Already in watts, no conversion needed
+                            logger.info(f"Extracted active power from second device: {power_w}W")
+                            return power_w
+            logger.error("Active power value not found in second device response data")
+            return None
+        else:
+            logger.error("Failed to get data from second device")
+            return None
+    except Exception as e:
+        error_msg = f"Failed to process second device data: {str(e)}"
+        logger.error(error_msg)
+        sendpb(
+            "FusionSolar Second Device Error",
+            f"Failed to process second device data\nError: {error_msg}"
+        )
         return None
 
 def get_fusion_solar_data(device_dn: str = "NE=165147722") -> None:
@@ -224,14 +301,30 @@ def get_fusion_solar_data(device_dn: str = "NE=165147722") -> None:
         data = client.get_device_realtime_data(device_dn)
 
         if data is not None:
-            power = extract_active_power(data)
-            if power is not None:
-                if send_to_domoticz(power):
-                    logger.info("Successfully completed the data fetch and forward process")
+            # Log all available signals first
+            log_all_signals(data)
+
+            power_data = extract_power_data(data)
+            if power_data is not None:
+                # Send active power to idx 77
+                if send_to_domoticz(77, power_data.active_power, "active power"):
+                    logger.info("Successfully sent active power to Domoticz")
                 else:
-                    logger.error("Failed to send data to Domoticz")
+                    logger.error("Failed to send active power to Domoticz")
+
+                # Get and send second device power to idx 78
+                second_device_power = get_second_device_power(client)
+                if second_device_power is not None:
+                    if send_to_domoticz(78, second_device_power, "second device power"):
+                        logger.info("Successfully sent second device power to Domoticz")
+                    else:
+                        logger.error("Failed to send second device power to Domoticz")
+                else:
+                    logger.error("Failed to get second device power")
+
+                logger.info("Successfully completed the data fetch and forward process")
             else:
-                logger.error("Failed to extract active power from response")
+                logger.error("Failed to extract power values from response")
         else:
             logger.error("Failed to get data from FusionSolar")
     except Exception as e:
